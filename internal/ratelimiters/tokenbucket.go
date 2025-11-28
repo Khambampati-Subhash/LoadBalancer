@@ -96,7 +96,3 @@ func (tb *TokenBucketAlgo) cleanUpTask() {
 		}
 	}
 }
-
-func (tb *TokenBucketAlgo) RunBackgroundTask(ip string) {
-	timer := time.AfterFunc(tb.ResetTime, func() {})
-}
