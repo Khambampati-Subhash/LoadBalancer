@@ -1,6 +1,3 @@
 package routingalgorithms
 
-
-type BalancingAlgorithms interface{
-	Process()
-}
+type BalancingAlgorithms interface{}
