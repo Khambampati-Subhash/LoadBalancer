@@ -124,28 +124,261 @@ func main() {
 
 	eew3, _ := json.Marshal(map1["london"])
 	os.WriteFile("london.log", eew3, os.ModeAppend)
-	// for _, j := range eer {
-	// 	if map1[j.From].Value >= j.Data {
-	// 		map1[j.From].Value -= j.Data
-	// 		map1[j.To].Value += j.Data
-	// 		ee1, err := json.Marshal(map1[j.From])
-	// 		if err != nil {
-	// 			fmt.Printf("Error while marshalling the data %s", err)
-	// 		}
-	// 		ee2, err := json.Marshal(map1[j.To])
-	// 		if err != nil {
-	// 			fmt.Printf("Error while marshalling the data %s", err)
-	// 		}
-	// 		err = os.WriteFile(j.From+".json", ee1, os.ModeAppend)
-	// 		if err != nil {
-	// 			fmt.Printf("Error while writing the data %s", err)
-	// 		}
-	// 		err = os.WriteFile(j.To+".json", ee2, os.ModeAppend)
-	// 		if err != nil {
-	// 			fmt.Printf("Error while writing the data %s", err)
-	// 		}
-	// 	} else {
-	// 		fmt.Errorf("Value in the %s is less than Data in the wal %v", j.From, j)
-	// 	}
-	// }
 }
+
+//
+// ## The function (for reference)
+//
+// ```go
+// func appendWAL(entry *Wal) error {
+//     f, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+//     if err != nil {
+//         return err
+//     }
+//     defer f.Close()
+//
+//     data, _ := json.Marshal(entry)
+//     _, err = f.Write(append(data, '\n'))
+//     if err != nil {
+//         return err
+//     }
+//
+//     return f.Sync()
+// }
+// ```
+//
+// ---
+//
+// # 1️⃣ `os.OpenFile(...)` — what exactly is happening?
+//
+// ```go
+// os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+// ```
+//
+// This tells the OS **how** we want to open the file.
+//
+// ---
+//
+// ## 🔹 `os.O_WRONLY`
+//
+// > **Open file for write-only access**
+//
+// * You can **write** to the file
+// * You cannot read from it
+// * This matches WAL behavior perfectly:
+//
+//   * WAL is written sequentially
+//   * WAL is never read during append
+//
+// Why not `O_RDWR`?
+//
+// * More permissions than needed
+// * Violates least-privilege principle
+// * Some OS-level optimizations depend on intent
+//
+// ---
+//
+// ## 🔹 `os.O_APPEND`
+//
+// > **Every write goes to the end of the file**
+//
+// This is **CRITICAL** for WAL.
+//
+// Without it:
+//
+// * Concurrent writes could overwrite data
+// * File offsets could be corrupted
+//
+// With `O_APPEND`:
+//
+// * OS guarantees atomic append
+// * Even with multiple goroutines/processes
+//
+// This is how databases safely allow concurrent writers.
+//
+// ---
+//
+// ## 🔹 `os.O_CREATE`
+//
+// > **Create the file if it doesn’t exist**
+//
+// Needed because:
+//
+// * On first startup, `wal.log` may not exist
+// * Recovery should not fail due to missing WAL
+//
+// ---
+//
+// # 2️⃣ `0o644` — file permissions (Unix)
+//
+// ```go
+// 0o644
+// ```
+//
+// This is an **octal number**.
+//
+// ### Breakdown:
+//
+// | Digit | Meaning | Permission   |
+// | ----- | ------- | ------------ |
+// | `6`   | Owner   | read + write |
+// | `4`   | Group   | read         |
+// | `4`   | Others  | read         |
+//
+// So:
+//
+// ```text
+// -rw-r--r--
+// ```
+//
+// ### Why this is good for WAL
+//
+// * Process can write
+// * Other users can inspect logs
+// * No one else can modify WAL
+//
+// ---
+//
+// ### Why octal (`0o`)?
+//
+// * File permissions are bitmasks
+// * Octal maps cleanly to permission bits
+// * `0o644` is clearer than `0644` in modern Go
+//
+// ---
+//
+// # 3️⃣ `json.Marshal(entry)`
+//
+// ```go
+// data, _ := json.Marshal(entry)
+// ```
+//
+// * Converts your WAL struct → JSON bytes
+// * Each WAL entry becomes a **self-contained record**
+// * This is your **logical log record**
+//
+// Note:
+//
+// * Error ignored here for brevity
+// * In production → always handle it
+//
+// ---
+//
+// # 4️⃣ `append(data, '\n')`
+//
+// ```go
+// f.Write(append(data, '\n'))
+// ```
+//
+// This creates **JSON Lines format**:
+//
+// ```text
+// {...}
+// {...}
+// {...}
+// ```
+//
+// Why newline?
+//
+// * Makes WAL **stream-friendly**
+// * Enables line-by-line replay
+// * Avoids parsing whole file into memory
+//
+// Databases and systems like Kafka do this.
+//
+// ---
+//
+// # 5️⃣ `f.Sync()` — THIS IS THE MOST IMPORTANT LINE
+//
+// ```go
+// return f.Sync()
+// ```
+//
+// ### What `Sync()` does
+//
+// > Forces the OS to flush file contents to **stable storage**
+//
+// Without `Sync()`:
+//
+// * OS may buffer writes in RAM
+// * Power loss / crash → WAL entry lost
+// * Client already got OK → data corruption
+//
+// ---
+//
+// ## 💥 What happens WITHOUT `fsync`
+//
+// Timeline:
+//
+// ```
+// 1. f.Write() → OS buffer
+// 2. return OK to client
+// 3. crash / power loss
+// 4. WAL entry gone
+// ```
+//
+// 🔥 This violates WAL guarantees.
+//
+// ---
+//
+// ## ✅ What happens WITH `fsync`
+//
+// ```
+// 1. f.Write()
+// 2. f.Sync() → disk platter / SSD
+// 3. return OK
+// 4. crash → WAL survives
+// ```
+//
+// ✔ This is why **databases are slow on writes**
+// ✔ Durability always costs latency
+//
+// ---
+//
+// # 6️⃣ Why databases worship fsync
+//
+// | System     | Uses fsync? |
+// | ---------- | ----------- |
+// | PostgreSQL | YES         |
+// | MySQL      | YES         |
+// | Kafka      | YES         |
+// | RocksDB    | YES         |
+//
+// If WAL is not fsync’d:
+//
+// > You don’t have a database, you have a cache.
+//
+// ---
+//
+// # 7️⃣ Why `defer f.Close()` is OK here
+//
+// * `Close()` releases file descriptor
+// * Data is already flushed via `Sync()`
+// * Safe even if crash happens after
+//
+// ---
+//
+// # 8️⃣ One-sentence summary (remember this)
+//
+// > **`os.O_APPEND` protects log order, `O_WRONLY` restricts access, `0644` controls permissions, and `fsync` makes WAL real.**
+//
+// ---
+//
+// # 9️⃣ Final mental model
+//
+// Think of WAL like:
+//
+// > ✍️ Writing in ink on paper — not pencil in memory.
+//
+// `fsync()` is the moment the ink dries.
+//
+// ---
+//
+// If you want, next we can:
+//
+// * Add **concurrent writers**
+// * Add **transaction IDs**
+// * Add **idempotent replay**
+// * Simulate **crash mid-write**
+//
+// Just tell me the next step.
