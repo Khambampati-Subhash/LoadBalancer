@@ -3,9 +3,15 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"io"
 	"os"
 	"time"
+)
+
+const (
+	walFile    = "wal.log"
+	offsetFile = "offset.meta"
 )
 
 type Wal struct {
@@ -14,7 +20,7 @@ type Wal struct {
 	From      string    `json:"from"`
 	To        string    `json:"to"`
 	Data      int       `json:"data"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Data struct {
@@ -22,108 +28,195 @@ type Data struct {
 	Value     int    `json:"value"`
 }
 
+type OffsetMeta struct {
+	LSN int64 `json:"lsn"`
+}
+
+/* ---------------- WAL APPEND ---------------- */
+
 func appendWAL(entry *Wal) error {
-	f, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(walFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	data, _ := json.Marshal(entry)
-	_, err = f.Write(append(data, '\n'))
+	b, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
 
-	return f.Sync()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+
+	return f.Sync() // durability guarantee
 }
 
-func replayWAL(state map[string]*Data) error {
-	file, err := os.Open("wal.log")
+/* ---------------- OFFSET READ ---------------- */
+
+func readLSN() (int64, error) {
+	f, err := os.Open(offsetFile)
 	if err != nil {
-		return nil // empty WAL is OK
+		return 0, nil
 	}
-	defer file.Close()
+	defer f.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		var e Wal
-		json.Unmarshal(scanner.Bytes(), &e)
+	var meta OffsetMeta
+	if err := json.NewDecoder(f).Decode(&meta); err != nil {
+		return 0, nil
+	}
+	return meta.LSN, nil
+}
 
-		if state[e.From].Value >= e.Data {
-			state[e.From].Value -= e.Data
-			state[e.To].Value += e.Data
+func writeLSN(lsn int64) error {
+	f, err := os.OpenFile(offsetFile, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+
+	meta := OffsetMeta{LSN: lsn}
+	if err := json.NewEncoder(f).Encode(&meta); err != nil {
+		return err
+	}
+
+	return f.Sync() // commit marker
+}
+
+/* ---------------- WAL REPLAY (IDEMPOTENT) ---------------- */
+
+func replayWAL(state map[string]*Data) (int64, error) {
+	startLSN, _ := readLSN()
+
+	f, err := os.Open(walFile)
+	if err != nil {
+		return startLSN, nil
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(startLSN, io.SeekStart); err != nil {
+		return startLSN, err
+	}
+
+	reader := bufio.NewReader(f)
+	currentLSN := startLSN
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return currentLSN, err
 		}
+
+		var e Wal
+		if err := json.Unmarshal(line, &e); err != nil {
+			break // partial WAL write → stop safely
+		}
+
+		from, ok1 := state[e.From]
+		to, ok2 := state[e.To]
+		if !ok1 || !ok2 {
+			return currentLSN, errors.New("invalid account location")
+		}
+
+		if from.Value >= e.Data {
+			from.Value -= e.Data
+			to.Value += e.Data
+		}
+
+		currentLSN += int64(len(line))
+	}
+
+	return currentLSN, nil
+}
+
+/* ---------------- SNAPSHOT (FSYNC'D) ---------------- */
+
+func persistSnapshot(state map[string]*Data) error {
+	for name, data := range state {
+		f, err := os.OpenFile(name+".log", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+
+		b, err := json.Marshal(data)
+		if err != nil {
+			f.Close()
+			return err
+		}
+
+		if _, err := f.Write(b); err != nil {
+			f.Close()
+			return err
+		}
+
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
+
+		f.Close()
 	}
 	return nil
 }
 
 func main() {
-	bos := &Data{}
-	file1, err := os.ReadFile("bos.log")
-	if err != nil {
-		fmt.Errorf("Error while opening the file %s", err)
-	}
-	err = json.Unmarshal(file1, &bos)
-	if err != nil {
-		fmt.Errorf("Error while unmarshalling the data %s", err)
-	}
-
-	pune := &Data{}
-	file2, err := os.ReadFile("pune.log")
-	if err != nil {
-		fmt.Errorf("Error while opening the file %s", err)
-	}
-	err = json.Unmarshal(file2, &pune)
-	if err != nil {
-		fmt.Errorf("Error while unmarshalling the data %s", err)
+	// Load snapshot
+	load := func(file string) *Data {
+		d := &Data{}
+		b, err := os.ReadFile(file)
+		if err == nil {
+			json.Unmarshal(b, d)
+		}
+		return d
 	}
 
-	london := &Data{}
-	file3, err := os.ReadFile("london.log")
-	if err != nil {
-		fmt.Errorf("Error while opening the file %s", err)
+	state := map[string]*Data{
+		"bos":    load("bos.log"),
+		"pune":   load("pune.log"),
+		"london": load("london.log"),
 	}
-	err = json.Unmarshal(file3, &london)
-	if err != nil {
-		fmt.Errorf("Error while unmarshalling the data %s", err)
-	}
-	fmt.Printf("Unmarshalled data properly %v, %v, %v", bos, pune, london)
-	map1 := make(map[string]*Data, 0)
 
-	// if _, exists := map1["bos"]; !exists {
-	// 	map1["bos"] = new(Data)
-	// }
-	map1["bos"] = bos
-	map1["pune"] = pune
-	map1["london"] = london
-
-	wal := &Wal{
-		Id:        "iuhvnf0vfdskn9-ncks8-cnksd",
+	// Example request
+	entry := &Wal{
+		Id:        "txn-001",
 		AccountID: 123,
 		From:      "bos",
 		To:        "pune",
 		Data:      3,
 		CreatedAt: time.Now(),
 	}
-	err = appendWAL(wal)
-	if err != nil {
-		fmt.Errorf("While Appending wal error  %s", err)
+
+	// 1. WAL append (durable)
+	if err := appendWAL(entry); err != nil {
+		panic(err)
 	}
 
-	err = replayWAL(map1)
+	// 2. Replay WAL → memory
+	lsn, err := replayWAL(state)
 	if err != nil {
-		fmt.Errorf("While replaying the data  %s", err)
+		panic(err)
 	}
 
-	eew1, _ := json.Marshal(map1["bos"])
-	os.WriteFile("bos.log", eew1, os.ModeAppend)
+	// 3. Persist snapshot (fsync'd)
+	if err := persistSnapshot(state); err != nil {
+		panic(err)
+	}
 
-	eew2, _ := json.Marshal(map1["pune"])
-	os.WriteFile("pune.log", eew2, os.ModeAppend)
-
-	eew3, _ := json.Marshal(map1["london"])
-	os.WriteFile("london.log", eew3, os.ModeAppend)
+	// 4. Commit LSN AFTER snapshot
+	if err := writeLSN(lsn); err != nil {
+		panic(err)
+	}
 }
 
 //
